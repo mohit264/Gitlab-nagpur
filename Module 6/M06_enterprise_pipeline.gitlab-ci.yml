@@ -1,0 +1,295 @@
+# ============================================================
+# RoboVision Controller — Enterprise Delivery Pipeline
+# Module 6: Multi-Environment with Manual Approval Gate
+#
+# Pipeline Flow:
+#   validate → test → build → deploy-dev → deploy-qa → deploy-prod
+#
+# Key patterns demonstrated:
+#   - Environment-scoped variables (per-env config injection)
+#   - Protected environments (role-based deployment access)
+#   - when: manual (human gate before production)
+#   - environment: tracking (deployment history + rollback)
+#   - Canary deployment pattern (commented, for discussion)
+#
+# References:
+#   https://docs.gitlab.com/ee/ci/environments/
+#   https://docs.gitlab.com/ee/ci/environments/protected_environments.html
+#   https://docs.gitlab.com/ee/ci/environments/deployment_approvals.html
+#   https://docs.gitlab.com/ee/user/project/releases/
+# ============================================================
+
+default:
+  image: python:3.11-slim
+  before_script:
+    - pip install --quiet -r requirements.txt
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+stages:
+  - validate
+  - test
+  - build
+  - deploy-dev
+  - deploy-qa
+  - deploy-prod
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHONPATH: "."
+  IMAGE_TAG: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  # IMAGE_TAG_LATEST is set per-environment to avoid dev:latest → prod accidents
+  # Environment-specific values (DATABASE_URL, APP_ENV, DEPLOY_TOKEN)
+  # are set in Settings → CI/CD → Variables with environment scope
+
+# ─── STAGE: validate ─────────────────────────────────────────
+
+lint:
+  stage: validate
+  script:
+    - flake8 app/ tests/ --max-line-length=120 --statistics
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths: [.cache/pip]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|release\/.*)$/'
+    - if: '$CI_COMMIT_TAG'
+
+# ─── STAGE: test ─────────────────────────────────────────────
+
+unit-tests:
+  stage: test
+  script:
+    - |
+      pytest tests/ \
+        --cov=app \
+        --cov-report=xml:coverage.xml \
+        --cov-report=term-missing \
+        --junitxml=test-results.xml \
+        -v
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      junit: test-results.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths: [test-results.xml, coverage.xml]
+    expire_in: 30 days
+    when: always
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths: [.cache/pip]
+
+# ─── STAGE: build ────────────────────────────────────────────
+
+build-image:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - |
+      docker build \
+        --tag $IMAGE_TAG \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+        --label "org.opencontainers.image.created=$(date -Iseconds)" \
+        --label "pipeline.id=$CI_PIPELINE_ID" \
+        .
+    - docker push $IMAGE_TAG
+    - echo "Image pushed: $IMAGE_TAG"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+  tags:
+    - docker
+
+# ─── STAGE: deploy-dev ───────────────────────────────────────
+# Fully automatic — runs after every main branch commit
+
+deploy-dev:
+  stage: deploy-dev
+  image: alpine:latest
+  before_script: []
+  script:
+    - echo "=== DEPLOYING TO DEVELOPMENT =============================="
+    - echo "  Image         : $IMAGE_TAG"
+    - echo "  Environment   : $APP_ENV"       # Injected from dev-scoped variable
+    - echo "  Database URL  : [masked]"        # DATABASE_URL is masked
+    - echo "  Deployed By   : $GITLAB_USER_NAME"
+    - echo "  Pipeline      : $CI_PIPELINE_URL"
+    - echo "==========================================================="
+    # Real deployment would be:
+    # kubectl set image deployment/robovision app=$IMAGE_TAG -n dev
+    # kubectl rollout status deployment/robovision -n dev --timeout=120s
+    - echo "Simulating deployment to dev..."
+    - sleep 2
+    - echo "✅ Development deployment successful"
+  environment:
+    name: dev
+    url: https://dev.robovision.lab
+    # auto_stop_in: 2 days  # Uncomment to auto-stop dev environments
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ─── STAGE: deploy-qa ────────────────────────────────────────
+# Automatic after dev — runs smoke tests
+
+deploy-qa:
+  stage: deploy-qa
+  image: alpine:latest
+  before_script: []
+  script:
+    - echo "=== DEPLOYING TO QA ======================================"
+    - echo "  Image         : $IMAGE_TAG"
+    - echo "  Environment   : $APP_ENV"       # Injected from qa-scoped variable
+    - echo "  Deployed By   : $GITLAB_USER_NAME"
+    - echo "==========================================================="
+    - echo "Simulating deployment to QA..."
+    - sleep 2
+    - echo "▶ Running smoke tests..."
+    - sleep 2
+    - echo "  ✅ GET /health → 200"
+    - echo "  ✅ GET /api/v1/robot/status → 200"
+    - echo "  ✅ POST /api/v1/robot/command (stop) → 202"
+    - echo "✅ QA smoke tests passed"
+    - echo "✅ QA deployment successful"
+  environment:
+    name: qa
+    url: https://qa.robovision.lab
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ─── STAGE: deploy-prod (automated checklist) ────────────────
+# Runs automatically — provides deployment summary before manual gate
+
+pre-production-summary:
+  stage: deploy-prod
+  image: alpine:latest
+  before_script: []
+  script:
+    - echo "╔══════════════════════════════════════════════════════════╗"
+    - echo "║          PRE-PRODUCTION DEPLOYMENT SUMMARY              ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    - echo "║  ✅ Code linting:          PASSED                       ║"
+    - echo "║  ✅ Unit tests:            PASSED                       ║"
+    - echo "║  ✅ Docker image build:    SUCCESSFUL                   ║"
+    - echo "║  ✅ Development deploy:    SUCCESSFUL                   ║"
+    - echo "║  ✅ QA deploy + smoke:     SUCCESSFUL                   ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    - echo "║  Commit SHA   : $CI_COMMIT_SHORT_SHA                    ║"
+    - echo "║  Branch       : $CI_COMMIT_BRANCH                       ║"
+    - echo "║  Image        : $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA ║"
+    - echo "║  Pipeline     : $CI_PIPELINE_URL                        ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    - echo "║  ⚠️  Production deployment requires manual approval.    ║"
+    - echo "║  ⚠️  Only Maintainers can trigger deploy-production.    ║"
+    - echo "╚══════════════════════════════════════════════════════════╝"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ─── STAGE: deploy-prod (MANUAL GATE) ────────────────────────
+# REQUIRES HUMAN APPROVAL
+# Only users with 'Maintainer' role on protected 'production' environment can trigger
+# Protected environment config: Settings → CI/CD → Protected Environments
+
+deploy-production:
+  stage: deploy-prod
+  image: alpine:latest
+  before_script: []
+  # Pipeline pauses here — shows ▶️ Play button in UI
+  # Audit log records: who triggered, when, which commit/image
+  when: manual
+  script:
+    - echo "╔══════════════════════════════════════════════════════════╗"
+    - echo "║              PRODUCTION DEPLOYMENT                      ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    - echo "║  ⚠️  PRODUCTION DEPLOYMENT IN PROGRESS                 ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    - echo "║  Approved By  : $GITLAB_USER_NAME                       ║"
+    - echo "║  Image        : $IMAGE_TAG                               ║"
+    - echo "║  Environment  : $APP_ENV"         # production-scoped variable
+    - echo "║  Timestamp    : $(date -Iseconds)                        ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    # Real deployment:
+    # kubectl set image deployment/robovision app=$IMAGE_TAG -n production
+    # kubectl rollout status deployment/robovision -n production --timeout=300s
+    - echo "▶ Deploying to production..."
+    - sleep 3
+    - echo "▶ Running production health verification..."
+    - sleep 2
+    - echo "║  ✅ Health check:          PASSED                       ║"
+    - echo "║  ✅ API readiness:         PASSED                       ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    - echo "║  ✅ PRODUCTION DEPLOYMENT COMPLETE                      ║"
+    - echo "╚══════════════════════════════════════════════════════════╝"
+  environment:
+    name: production
+    url: https://api.robovision.io
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# ─── ROLLBACK (Emergency Use Only) ───────────────────────────
+# Re-run this job from a PREVIOUS pipeline to roll back
+# Or use Environments → <env> → Deployment history → Re-deploy
+
+rollback-production:
+  stage: deploy-prod
+  image: alpine:latest
+  before_script: []
+  when: manual
+  script:
+    - echo "╔══════════════════════════════════════════════════════════╗"
+    - echo "║              ⚠️  PRODUCTION ROLLBACK                    ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    - echo "║  Initiated By : $GITLAB_USER_NAME                       ║"
+    - echo "║  Timestamp    : $(date -Iseconds)                        ║"
+    - echo "╠══════════════════════════════════════════════════════════╣"
+    - echo "║  ROLLBACK OPTIONS:                                      ║"
+    - echo "║  1. Navigate to Environments → production               ║"
+    - echo "║  2. Find last stable deployment in history              ║"
+    - echo "║  3. Click Re-deploy on that deployment                  ║"
+    - echo "║  This will redeploy the previous image tag.             ║"
+    - echo "╚══════════════════════════════════════════════════════════╝"
+    # In Kubernetes:
+    # kubectl rollout undo deployment/robovision -n production
+  environment:
+    name: production
+    action: rollback
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+# ─── RELEASE (Tag-based, Optional) ───────────────────────────
+# Creates a formal GitLab Release when a semver tag is pushed
+# Attach artifacts, generate release notes from MR descriptions
+# Requires: release-cli in PATH (use registry.gitlab.com/gitlab-org/release-cli)
+
+# Uncomment when ready to use formal releases:
+#
+# create-release:
+#   stage: deploy-prod
+#   image: registry.gitlab.com/gitlab-org/release-cli:latest
+#   before_script: []
+#   script:
+#     - echo "Creating GitLab Release for tag $CI_COMMIT_TAG"
+#   release:
+#     name: "RoboVision Controller $CI_COMMIT_TAG"
+#     description: "Automated release for $CI_COMMIT_TAG. See CHANGELOG.md."
+#     tag_name: $CI_COMMIT_TAG
+#     assets:
+#       links:
+#         - name: "Docker Image"
+#           url: "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+#           link_type: image
+#   rules:
+#     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'   # semver tags only
