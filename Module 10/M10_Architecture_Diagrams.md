@@ -49,7 +49,7 @@ graph LR
     subgraph TAINT_FLOW ["Taint Flow Trace"]
         SOURCE["SOURCE\nrobot_id =\nrequest.args.get('robot_id')\n\n⚠️ User-controlled\nData marked as TAINTED"]
 
-        ASSIGN["ASSIGNMENT\nquery = 'SELECT ... WHERE id='\n         + robot_id + '\"\n\n⚠️ Taint PROPAGATES\ninto query variable"]
+        ASSIGN["ASSIGNMENT\nquery = 'SELECT ... WHERE id='\n         + robot_id + '\n\n⚠️ Taint PROPAGATES\ninto query variable"]
 
         SANITISER_CHECK{"Sanitiser\npresent?"}
 
